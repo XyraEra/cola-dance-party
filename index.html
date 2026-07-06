@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#14141c" />
+  <meta name="description" content="Soda Jerk — a gesture-controlled soda fountain game. No controller: lean, raise, clap, shake, and push to serve every order." />
+  <title>Soda Jerk — Gesture-Powered Soda Fountain</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Bungee&family=Orbitron:wght@700;900&family=Fredoka:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="stage">
+
+    <!-- ============================================================ -->
+    <!-- START SCREEN                                                  -->
+    <!-- ============================================================ -->
+    <section id="start-screen" class="screen start-screen">
+      <div class="neon-sign" aria-hidden="true">
+        <span class="neon-sign__open">OPEN</span>
+      </div>
+
+      <h1 class="logo">
+        <span class="logo__script">the</span>
+        Soda Jerk
+      </h1>
+
+      <p class="tagline">
+        Run the fountain with nothing but your body. No controller, no clicking — just moves.
+      </p>
+
+      <ul class="move-legend" aria-label="The five moves you'll use">
+        <li class="move-legend__item">
+          <span class="move-legend__icon" aria-hidden="true">🥤</span>
+          <span class="move-legend__label">Lean</span>
+        </li>
+        <li class="move-legend__item">
+          <span class="move-legend__icon" aria-hidden="true">🙌</span>
+          <span class="move-legend__label">Raise</span>
+        </li>
+        <li class="move-legend__item">
+          <span class="move-legend__icon" aria-hidden="true">🧊</span>
+          <span class="move-legend__label">Clap</span>
+        </li>
+        <li class="move-legend__item">
+          <span class="move-legend__icon" aria-hidden="true">🕺</span>
+          <span class="move-legend__label">Shake</span>
+        </li>
+        <li class="move-legend__item">
+          <span class="move-legend__icon" aria-hidden="true">✋</span>
+          <span class="move-legend__label">Push</span>
+        </li>
+      </ul>
+
+      <button id="start-button" class="btn btn--primary" type="button">Punch In</button>
+
+      <p class="fine-print">
+        Needs webcam access. Stand back far enough for the camera to see your shoulders and hands.
+      </p>
+    </section>
+
+    <!-- ============================================================ -->
+    <!-- CALIBRATION OVERLAY                                           -->
+    <!-- ============================================================ -->
+    <div id="calibration-overlay" class="overlay calibration-overlay hidden">
+      <div class="calibration-ring" aria-hidden="true"></div>
+      <p id="calibration-message" class="calibration-message">Stand naturally, hold still...</p>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- GAMEPLAY HUD                                                  -->
+    <!-- ============================================================ -->
+    <main id="hud" class="hud hidden">
+
+      <header class="stat-rail">
+        <div class="stat-rail__brand">Soda Jerk</div>
+        <div class="stat-rail__stats">
+          <div class="stat">
+            <span class="stat__label">Score</span>
+            <span id="score-value" class="stat__value">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat__label">Combo</span>
+            <span id="combo-value" class="stat__value stat__value--combo"></span>
+          </div>
+          <div class="stat">
+            <span class="stat__label">Level</span>
+            <span id="level-value" class="stat__value">1</span>
+          </div>
+          <div class="stat">
+            <span class="stat__label">Lives</span>
+            <span id="lives-value" class="stat__value">❤️❤️❤️</span>
+          </div>
+        </div>
+      </header>
+
+      <div class="floor">
+
+        <!-- Camera + action side -->
+        <section class="counter" aria-label="Your camera feed and current move">
+          <div class="camera-housing">
+            <video id="webcam" class="camera-feed" autoplay playsinline muted aria-label="Your live camera feed"></video>
+            <canvas id="skeleton-canvas" class="camera-skeleton" aria-hidden="true"></canvas>
+            <div id="tracking-lost-banner" class="tracking-lost-banner hidden">Step back into frame!</div>
+          </div>
+
+          <div class="action-prompt">
+            <span id="current-action-icon" class="action-prompt__icon" aria-hidden="true">🥤</span>
+            <span id="current-action-label" class="action-prompt__label">Lean Left — Cola</span>
+          </div>
+
+          <div class="timer-track">
+            <div id="timer-bar-fill" class="timer-track__fill"></div>
+          </div>
+        </section>
+
+        <!-- Order ticket side -->
+        <aside class="ticket" aria-label="Current order">
+          <div class="ticket__header">
+            <span class="ticket__stub">Order Up</span>
+          </div>
+          <p class="ticket__customer">Customer: <span id="customer-name">—</span></p>
+          <h2 id="order-name" class="ticket__order">—</h2>
+          <ol id="steps-list" class="ticket__steps">
+            <!-- populated by game.js -->
+          </ol>
+        </aside>
+
+      </div>
+    </main>
+
+    <!-- ============================================================ -->
+    <!-- FEEDBACK POPUP (stars / missed)                               -->
+    <!-- ============================================================ -->
+    <div id="feedback" class="feedback" aria-live="polite"></div>
+
+    <!-- ============================================================ -->
+    <!-- GAME OVER SCREEN                                              -->
+    <!-- ============================================================ -->
+    <section id="game-over-screen" class="screen game-over-screen hidden">
+      <h1 class="logo logo--small">Shift Over</h1>
+      <p class="game-over-score">Final score: <span id="final-score">0</span></p>
+      <button id="restart-button" class="btn btn--primary" type="button">Punch In Again</button>
+    </section>
+
+  </div>
+
+  <script type="module" src="game.js"></script>
+</body>
+</html>
