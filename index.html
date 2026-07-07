@@ -100,6 +100,7 @@
             <span id="lives-value" class="stat__value">❤️❤️❤️</span>
           </div>
         </div>
+        <button id="mute-button" class="mute-button" type="button" aria-label="Toggle music">🔊</button>
       </header>
 
       <div class="floor">
@@ -108,7 +109,6 @@
         <section class="counter" aria-label="Your camera feed and current move">
           <div class="camera-housing">
             <video id="webcam" class="camera-feed" autoplay playsinline muted aria-label="Your live camera feed"></video>
-            <canvas id="skeleton-canvas" class="camera-skeleton" aria-hidden="true"></canvas>
             <div id="tracking-lost-banner" class="tracking-lost-banner hidden">Step back into frame!</div>
           </div>
 
@@ -152,6 +152,8 @@
     </section>
 
   </div>
+
+  <pre id="debug-panel" class="debug-panel hidden" aria-hidden="true"></pre>
 
   <script type="module" src="game.js"></script>
 </body>
