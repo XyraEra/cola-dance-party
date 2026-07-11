@@ -4,8 +4,32 @@
 // Wraps MediaPipe Tasks-Vision (PoseLandmarker + HandLandmarker) into a single
 // BodyTracker class that turns raw webcam landmarks into discrete, game-ready
 // gesture EVENTS. This file knows nothing about soda, customers, or scoring —
-// game.js consumes it purely through events. That separation is deliberate:
-// you can retune/rewrite gesture detection here without touching game logic.
+// game.js consumes it purely through events.
+//
+// v2 changes (tuned for a fast, "dance-like" pace + easier debugging):
+//   - Every hold-time/cooldown/threshold was shortened so gestures register
+//     in a few hundred ms instead of half a second-plus. See CONFIG.
+//   - HandLandmarker now runs every CONFIG.handFrameSkip-th frame instead of
+//     every frame (PoseLandmarker still runs every frame) — pose drives the
+//     time-critical gestures (lean/raise/clap/shake), so this cuts total
+//     inference cost with the least gameplay impact.
+//   - Calibration no longer silently disables 'handsForward' for the whole
+//     session if hands weren't visible during calibration; it falls back to
+//     a shoulder-width-based estimate instead.
+//   - Every frame now reports live diagnostic numbers (current value vs.
+//     threshold) via the 'pose' event's `debug` field, so you can see
+//     exactly why a gesture did or didn't fire instead of guessing.
+//
+// v3 changes (from real playtesting):
+//   - invertHandedness was flipped to false. Testing showed MediaPipe's raw
+//     left/right labels already matched the player's real anatomy for this
+//     raw-frame + CSS-mirror setup; the old default was inverting a label
+//     that didn't need it, which meant "raise right hand" only ever matched
+//     when the (mislabeled) left hand went up too — i.e. you needed both.
+//   - _detectShake no longer looks only at shoulder side-to-side sway. It
+//     now sums movement across shoulders, hips, AND wrists over a rolling
+//     window, so real dancing (hips + hands moving) registers, not just one
+//     specific oscillation pattern.
 //
 // PUBLIC API
 // -----------------------------------------------------------------------------
@@ -22,9 +46,10 @@
 //   'calibrated'  -> baseline captured. detail = { shoulderMidX, shoulderWidth, handSize }
 //   'found'       -> a body re-entered frame after being lost. No payload.
 //   'lost'        -> no body detected for CONFIG.trackingLostMs. No payload.
-//   'pose'        -> fires every processed frame (post-smoothing), for drawing
-//                    a debug skeleton or a "lean meter" UI.
-//                    detail = { pose: Landmark[33], hands: Landmark[21][], handedness }
+//   'pose'        -> fires every processed frame.
+//                    detail = { pose: Landmark[33], hands: Landmark[21][], handedness, debug }
+//                    `debug` holds live numbers (current value vs. threshold)
+//                    for every detector.
 //   'gesture'     -> a discrete action was detected. detail.type is one of:
 //                      'lean'          detail = { direction: 'left'|'right'|'center' }
 //                      'raiseHand'     detail = { side: 'left'|'right' }
@@ -34,12 +59,14 @@
 //
 // A NOTE ON LEFT/RIGHT
 // -----------------------------------------------------------------------------
-// MediaPipe labels pose/hand landmarks as if describing someone else's body
-// from the camera's viewpoint. Since your webcam faces you like a mirror,
-// what MediaPipe calls the subject's "right side" is actually YOUR left side.
-// CONFIG.invertHandedness (default true) flips this so 'raiseHand: right'
-// really means the player's own right hand. If left/right ever feel swapped
-// during playtesting, that's the flag to toggle first.
+// We feed MediaPipe the RAW (unmirrored) camera frame — only the on-screen
+// <video> is flipped, via CSS, for a natural "mirror" look. In theory a raw
+// (non-selfie-oriented) frame should come out with left/right reversed
+// relative to the player, which is why invertHandedness existed — but real
+// testing showed MediaPipe's raw labels already matched the player's actual
+// anatomy here, so the correction is now OFF by default. If gestures ever
+// feel mirrored again (e.g. "raise right" only fires when you raise your
+// left), that's the flag to toggle back to true.
 // =============================================================================
 
 import {
@@ -56,38 +83,34 @@ const HAND_MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 // ---- Tunable thresholds ----------------------------------------------------
-// Everything gameplay-feel-related lives here so you can retune without
-// hunting through detector logic. Values are fractions of body-relative
-// measurements (shoulder width, torso length) so they scale with distance
-// from the camera and different body sizes.
 export const CONFIG = {
-  targetFps: 30, // throttle inference; webcams/rAF often run faster than needed
-  smoothingAlpha: 0.5, // 0..1, higher = snappier but jitterier
+  targetFps: 34,
+  handFrameSkip: 2, // run HandLandmarker on 1 out of every N processed frames
+  smoothingAlpha: 0.65, // 0..1, higher = snappier but jitterier
 
-  leanEnterThreshold: 0.35, // shoulder-mid offset (x shoulder widths) to trigger
-  leanExitThreshold: 0.18, // must return inside this to count as "center" again
-  leanHoldMs: 150, // must be sustained this long before it fires
+  leanEnterThreshold: 0.26,
+  leanExitThreshold: 0.13,
+  leanHoldMs: 70,
 
-  raiseThreshold: 0.35, // wrist above shoulder, x torso lengths
-  raiseHoldMs: 100,
-  raiseCooldownMs: 500,
+  raiseThreshold: 0.28,
+  raiseHoldMs: 50,
+  raiseCooldownMs: 220,
 
-  clapApartThreshold: 0.9, // wrists must have been at least this far apart (x shoulder widths)...
-  clapDistanceThreshold: 0.35, // ...then come together closer than this to count as a clap
-  clapCooldownMs: 400,
+  clapApartThreshold: 0.8,
+  clapDistanceThreshold: 0.4,
+  clapCooldownMs: 250,
 
-  shakeWindowMs: 700, // rolling window used to detect oscillation
-  shakeMinReversals: 3, // direction changes required inside the window
-  shakeAmplitude: 0.12, // min side-to-side range, x shoulder widths
-  shakeCooldownMs: 600,
+  shakeWindowMs: 500,
+  shakeEnergyThreshold: 4.5, // sum of normalized movement across shoulders/hips/wrists in the window
+  shakeCooldownMs: 350,
 
-  forwardScaleFactor: 1.5, // hands must appear this much bigger than baseline
-  forwardCooldownMs: 500,
+  forwardScaleFactor: 1.35,
+  forwardCooldownMs: 280,
 
-  trackingLostMs: 800, // no pose for this long -> emit 'lost'
+  trackingLostMs: 800,
 
-  mirrored: true, // is the <video>/<canvas> shown flipped via CSS (recommended)?
-  invertHandedness: true, // see "A NOTE ON LEFT/RIGHT" above
+  mirrored: true,
+  invertHandedness: false,
 };
 
 function lerp(a, b, t) {
@@ -113,8 +136,6 @@ export class BodyTracker extends EventTarget {
     this.video = videoEl;
     this.config = { ...CONFIG, ...userConfig };
 
-    // See "A NOTE ON LEFT/RIGHT" — these indices already point at the
-    // PLAYER's true anatomical side, not MediaPipe's raw camera-facing labels.
     this.SIDE = this.config.invertHandedness
       ? { L_SHOULDER: 12, R_SHOULDER: 11, L_WRIST: 16, R_WRIST: 15, L_HIP: 24, R_HIP: 23 }
       : { L_SHOULDER: 11, R_SHOULDER: 12, L_WRIST: 15, R_WRIST: 16, L_HIP: 23, R_HIP: 24 };
@@ -129,15 +150,26 @@ export class BodyTracker extends EventTarget {
     this._lastSeenTime = 0;
     this._wasTracking = false;
     this._lastFrame = null;
+    this._frameCount = 0;
+    this._cachedHands = [];
+    this._cachedHandedness = [];
 
-    // Per-gesture detector state
+    this._debug = {
+      calibrated: false,
+      leanOffset: 0, leanThreshold: this.config.leanEnterThreshold,
+      raiseLeft: 0, raiseRight: 0, raiseThreshold: this.config.raiseThreshold,
+      clapDist: 0, clapThreshold: this.config.clapDistanceThreshold,
+      shakeEnergy: 0, shakeThreshold: this.config.shakeEnergyThreshold,
+      forwardScale: 0, forwardThreshold: this.config.forwardScaleFactor,
+    };
+
     this._lean = { state: "center", pending: null, pendingSince: 0 };
     this._raise = {
       left: { raised: false, since: 0, last: 0 },
       right: { raised: false, since: 0, last: 0 },
     };
     this._clap = { wasApart: true, last: 0 };
-    this._shake = { buffer: [], last: 0 };
+    this._shake = { buffer: [], last: 0, prevPoints: null };
     this._forward = { last: 0 };
 
     this._loop = this._loop.bind(this);
@@ -168,8 +200,6 @@ export class BodyTracker extends EventTarget {
     this.dispatchEvent(new CustomEvent("ready"));
   }
 
-  // Tries GPU first (fast, but unsupported on some browsers/OSes), falls
-  // back to CPU/WASM so the game still runs everywhere, just a bit slower.
   async _createLandmarkers(vision) {
     const delegates = ["GPU", "CPU"];
     let lastErr;
@@ -212,22 +242,34 @@ export class BodyTracker extends EventTarget {
     this.hands?.close();
   }
 
-  // Captures a short "stand still / hands at chest height" baseline so
-  // lean/raise/clap/forward thresholds adapt to this player's size and
-  // distance from the camera. Call at the start of each play session
-  // (re-calibrating between rounds isn't necessary unless the player moves).
-  calibrate(durationMs = 1200) {
-    return new Promise((resolve) => {
+  // Requires BOTH a minimum time AND a minimum number of frames where a body
+  // was actually detected before finalizing a baseline. Without this guard,
+  // if the models are still warming up or you're not in frame yet, it would
+  // happily average zero real samples into a baseline of (0, 0) — after
+  // which every real reading looks like a giant, permanent lean in one
+  // direction, and leaning further that way (or the other way) does nothing.
+  calibrate(minDurationMs = 1200, { minSamples = 15, maxWaitMs = 6000 } = {}) {
+    return new Promise((resolve, reject) => {
       const samples = [];
       const startedAt = performance.now();
       const collect = () => {
         if (this._lastFrame) samples.push(this._lastFrame);
-        if (performance.now() - startedAt < durationMs) {
-          requestAnimationFrame(collect);
-        } else {
+        const elapsed = performance.now() - startedAt;
+        const haveEnough = samples.length >= minSamples && elapsed >= minDurationMs;
+
+        if (haveEnough) {
           this.baseline = this._computeBaseline(samples);
+          this._debug.calibrated = true;
           this.dispatchEvent(new CustomEvent("calibrated", { detail: this.baseline }));
           resolve(this.baseline);
+        } else if (elapsed >= maxWaitMs) {
+          reject(
+            new Error(
+              "Couldn't get a clear view of you. Step back so your shoulders and hands are both visible, check the lighting, then try again."
+            )
+          );
+        } else {
+          requestAnimationFrame(collect);
         }
       };
       collect();
@@ -250,10 +292,14 @@ export class BodyTracker extends EventTarget {
       }
     }
 
+    const avgShoulderWidth = Math.max(0.05, shoulderWidth / n);
     return {
       shoulderMidX: shoulderMidX / n,
-      shoulderWidth: Math.max(0.05, shoulderWidth / n),
-      handSize: handCount ? handSize / handCount : null,
+      shoulderWidth: avgShoulderWidth,
+      // Falls back to a shoulder-width estimate if hands weren't visible
+      // during calibration, so 'handsForward' doesn't get silently disabled
+      // for the whole session.
+      handSize: handCount ? handSize / handCount : avgShoulderWidth * 0.35,
     };
   }
 
@@ -269,7 +315,6 @@ export class BodyTracker extends EventTarget {
 
   _processFrame(now) {
     const poseResult = this.pose.detectForVideo(this.video, now);
-    const handResult = this.hands.detectForVideo(this.video, now);
     const landmarks = poseResult.landmarks?.[0];
 
     if (!landmarks) {
@@ -284,27 +329,39 @@ export class BodyTracker extends EventTarget {
     }
 
     const pose = this._smooth("pose", landmarks);
-    const hands = (handResult.landmarks || []).map((lm, i) => this._smooth(`hand${i}`, lm));
-    const handedness = (handResult.handedness || []).map((cats) =>
-      cats.map((c) => ({
-        ...c,
-        categoryName:
-          this.config.invertHandedness
-            ? c.categoryName === "Left" ? "Right" : "Left"
-            : c.categoryName,
-      }))
-    );
+
+    this._frameCount++;
+    let hands = this._cachedHands;
+    let handedness = this._cachedHandedness;
+    if (this._frameCount % this.config.handFrameSkip === 0) {
+      const handResult = this.hands.detectForVideo(this.video, now);
+      hands = (handResult.landmarks || []).map((lm, i) => this._smooth(`hand${i}`, lm));
+      handedness = (handResult.handedness || []).map((cats) =>
+        cats.map((c) => ({
+          ...c,
+          categoryName:
+            this.config.invertHandedness
+              ? c.categoryName === "Left" ? "Right" : "Left"
+              : c.categoryName,
+        }))
+      );
+      this._cachedHands = hands;
+      this._cachedHandedness = handedness;
+    }
 
     this._lastFrame = { pose, hands, handedness };
-    this.dispatchEvent(new CustomEvent("pose", { detail: this._lastFrame }));
 
-    if (!this.baseline) return; // gestures need a baseline first
+    if (this.baseline) {
+      this._detectLean(pose, now);
+      this._detectRaise(pose, now);
+      this._detectClap(pose, now);
+      this._detectShake(pose, now);
+      this._detectForward(hands, now);
+    }
 
-    this._detectLean(pose, now);
-    this._detectRaise(pose, now);
-    this._detectClap(pose, now);
-    this._detectShake(pose, now);
-    this._detectForward(hands, now);
+    this.dispatchEvent(
+      new CustomEvent("pose", { detail: { ...this._lastFrame, debug: { ...this._debug } } })
+    );
   }
 
   _handleTrackingLost(now) {
@@ -314,9 +371,6 @@ export class BodyTracker extends EventTarget {
     }
   }
 
-  // Simple exponential smoothing per landmark to cut jitter before it
-  // reaches gesture logic. Good enough here; swap for a One-Euro filter
-  // later if fast gestures ever feel laggy.
   _smooth(key, landmarks) {
     const alpha = this.config.smoothingAlpha;
     const prev = this._smoothed[key];
@@ -346,9 +400,8 @@ export class BodyTracker extends EventTarget {
     const shoulderMidX = (ls.x + rs.x) / 2;
 
     let offset = (shoulderMidX - this.baseline.shoulderMidX) / this.baseline.shoulderWidth;
-    // Display is mirrored (see CONFIG.mirrored), so flip the sign to match
-    // what the player visually sees as "their" left/right on screen.
     if (this.config.mirrored) offset = -offset;
+    this._debug.leanOffset = offset;
 
     const c = this._lean;
     const enterDir =
@@ -381,7 +434,8 @@ export class BodyTracker extends EventTarget {
       const hip = pose[this.SIDE[`${prefix}_HIP`]];
       const wrist = pose[this.SIDE[`${prefix}_WRIST`]];
       const torsoLength = Math.max(0.05, Math.abs(hip.y - shoulder.y));
-      const raisedAmount = (shoulder.y - wrist.y) / torsoLength; // + = wrist above shoulder
+      const raisedAmount = (shoulder.y - wrist.y) / torsoLength;
+      this._debug[side === "left" ? "raiseLeft" : "raiseRight"] = raisedAmount;
 
       const st = this._raise[side];
       const isRaised = raisedAmount > this.config.raiseThreshold && wrist.visibility > 0.4;
@@ -410,6 +464,7 @@ export class BodyTracker extends EventTarget {
     const rs = pose[this.SIDE.R_SHOULDER];
     const shoulderWidth = Math.max(0.05, dist(ls, rs));
     const wristDist = dist(lw, rw) / shoulderWidth;
+    this._debug.clapDist = wristDist;
 
     const c = this._clap;
     if (wristDist > this.config.clapApartThreshold) c.wasApart = true;
@@ -425,34 +480,35 @@ export class BodyTracker extends EventTarget {
     }
   }
 
+  // Sums how much shoulders, hips, and wrists moved frame-to-frame, over a
+  // rolling time window. This deliberately doesn't care about direction or
+  // pattern — swaying hips, waving hands, bouncing shoulders, or any mix of
+  // the three all add up to "shake". That matches actual dancing much better
+  // than requiring one specific side-to-side oscillation.
   _detectShake(pose, now) {
-    const ls = pose[this.SIDE.L_SHOULDER];
-    const rs = pose[this.SIDE.R_SHOULDER];
-    const shoulderWidth = Math.max(0.05, Math.abs(ls.x - rs.x));
-    const midX = (ls.x + rs.x) / 2;
+    const points = [
+      pose[this.SIDE.L_SHOULDER], pose[this.SIDE.R_SHOULDER],
+      pose[this.SIDE.L_HIP], pose[this.SIDE.R_HIP],
+      pose[this.SIDE.L_WRIST], pose[this.SIDE.R_WRIST],
+    ];
+    const shoulderWidth = Math.max(0.05, dist(pose[this.SIDE.L_SHOULDER], pose[this.SIDE.R_SHOULDER]));
+
+    let frameEnergy = 0;
+    const prev = this._shake.prevPoints;
+    if (prev) {
+      for (let i = 0; i < points.length; i++) frameEnergy += dist(points[i], prev[i]);
+    }
+    this._shake.prevPoints = points.map((p) => ({ x: p.x, y: p.y }));
 
     const buf = this._shake.buffer;
-    buf.push({ x: midX, t: now });
+    buf.push({ e: frameEnergy / shoulderWidth, t: now });
     while (buf.length && now - buf[0].t > this.config.shakeWindowMs) buf.shift();
-    if (buf.length < 5) return;
 
-    let reversals = 0;
-    let dir = 0;
-    let minX = buf[0].x, maxX = buf[0].x;
-    for (let i = 1; i < buf.length; i++) {
-      minX = Math.min(minX, buf[i].x);
-      maxX = Math.max(maxX, buf[i].x);
-      const d = buf[i].x - buf[i - 1].x;
-      if (Math.abs(d) < 1e-4) continue;
-      const s = Math.sign(d);
-      if (dir !== 0 && s !== dir) reversals++;
-      dir = s;
-    }
-    const amplitude = (maxX - minX) / shoulderWidth;
+    const totalEnergy = buf.reduce((sum, b) => sum + b.e, 0);
+    this._debug.shakeEnergy = totalEnergy;
 
     if (
-      reversals >= this.config.shakeMinReversals &&
-      amplitude > this.config.shakeAmplitude &&
+      totalEnergy > this.config.shakeEnergyThreshold &&
       now - this._shake.last > this.config.shakeCooldownMs
     ) {
       this._shake.last = now;
@@ -461,15 +517,11 @@ export class BodyTracker extends EventTarget {
     }
   }
 
-  // Depth proxy: a monocular webcam can't measure true distance, so we infer
-  // "hands pushed toward camera" from hands appearing larger than baseline.
-  // This is the least precise detector — expect to retune forwardScaleFactor,
-  // or swap the gesture for something more reliable (e.g. "spread hands wide")
-  // if it feels flaky during playtesting.
   _detectForward(hands, now) {
     if (!this.baseline.handSize || hands.length < 1) return;
     const avgSize = hands.reduce((sum, h) => sum + bboxDiagonal(h), 0) / hands.length;
     const scale = avgSize / this.baseline.handSize;
+    this._debug.forwardScale = scale;
 
     if (
       scale > this.config.forwardScaleFactor &&
