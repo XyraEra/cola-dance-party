@@ -9,9 +9,11 @@
 // REQUIRED DOM ELEMENTS (index.html must provide all of these by id)
 // -----------------------------------------------------------------------------
 //   webcam                 <video>   the live camera feed, passed to BodyTracker
-//   skeleton-canvas         <canvas>  OPTIONAL debug overlay — same size/position
-//                                     as #webcam, same mirror transform, or omit
-//                                     it entirely and skeleton drawing is skipped
+//   mute-button             <button>  toggles background music on/off
+//   debug-panel             <pre>     hidden by default; press "d" during play
+//                                     to show live gesture numbers vs. their
+//                                     thresholds — use this to see exactly why
+//                                     a gesture isn't registering
 //   start-screen            <div>     initial landing screen
 //   start-button            <button>  begins camera init + calibration
 //   calibration-overlay     <div>     shown while calibrating, starts hidden
@@ -43,17 +45,18 @@ import { BodyTracker } from "./bodytracking.js";
 // ---- Game-balance tuning ----------------------------------------------------
 const CONFIG = {
   startingLives: 3,
-  calibrationMs: 1500,
-  orderIntroMs: 1200, // pause to read the order before the timer starts
-  resultDisplayMs: 1400, // how long the star popup / miss popup stays up
+  calibrationMs: 1200,
+  orderIntroMs: 700, // pause to read the order before the timer starts
+  resultDisplayMs: 900, // how long the star popup / miss popup stays up
   levelUpEveryOrders: 3,
-  baseTimeMs: 9000,
-  perStepTimeMs: 2400,
-  perLevelTimePenaltyMs: 500,
-  minTimeMs: 6000,
-  maxTimeMs: 26000,
+  // Tuned so a whole order takes a handful of seconds, not twenty — each
+  // step should feel like the next beat of a dance, not a leisurely task.
+  baseTimeMs: 2800,
+  perStepTimeMs: 900,
+  perLevelTimePenaltyMs: 250,
+  minTimeMs: 2500,
+  maxTimeMs: 12000,
   comboScoreBonus: 0.12, // +12% score per combo stack beyond the first
-  showSkeleton: true,
 };
 
 // ---- Ingredient catalog -----------------------------------------------------
@@ -99,13 +102,117 @@ function pickRandom(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
+// =============================================================================
+// Audio: tiny procedural chiptune engine (Web Audio API)
+// -----------------------------------------------------------------------------
+// This does NOT use the YouTube track from the link — there's no tool here
+// that downloads or extracts audio from YouTube, and reusing someone else's
+// copyrighted music isn't something this project can do safely regardless.
+// Instead this synthesizes a small original 8-bit-style beat plus gesture SFX
+// entirely in the browser: no external file, nothing to license, and it still
+// gives the fast pace something to move to. If you want that exact track,
+// the simplest path is to get a licensed copy yourself and drop it in as
+// `<audio id="bg-music" src="your-file.mp3" loop>`, then swap the calls below
+// for `.play()` / `.pause()` on that element.
+// =============================================================================
+const Audio = {
+  ctx: null,
+  musicGain: null,
+  sfxGain: null,
+  timer: null,
+  step: 0,
+  musicOn: true,
+
+  init() {
+    if (this.ctx) return;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return; // very old browser — game still works, just silent
+    this.ctx = new Ctx();
+    this.musicGain = this.ctx.createGain();
+    this.musicGain.gain.value = 0.1;
+    this.musicGain.connect(this.ctx.destination);
+    this.sfxGain = this.ctx.createGain();
+    this.sfxGain.gain.value = 0.25;
+    this.sfxGain.connect(this.ctx.destination);
+  },
+
+  // AudioContext starts "suspended" until a user gesture allows it — call
+  // this from inside a click handler (startFlow is one).
+  resume() {
+    if (this.ctx && this.ctx.state === "suspended") this.ctx.resume();
+  },
+
+  _tone(freq, duration, { type = "square", bus = "sfx", volume = 1, delay = 0 } = {}) {
+    if (!this.ctx) return;
+    const dest = bus === "music" ? this.musicGain : this.sfxGain;
+    const t0 = this.ctx.currentTime + delay;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.linearRampToValueAtTime(volume, t0 + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+    osc.connect(g);
+    g.connect(dest);
+    osc.start(t0);
+    osc.stop(t0 + duration + 0.03);
+  },
+
+  playCorrect() {
+    this._tone(880, 0.1, { type: "square", volume: 0.5 });
+  },
+  playMistake() {
+    this._tone(150, 0.15, { type: "sawtooth", volume: 0.35 });
+  },
+  playServe() {
+    [660, 880, 1318].forEach((f, i) => this._tone(f, 0.13, { type: "square", volume: 0.5, delay: i * 0.05 }));
+  },
+  playMissed() {
+    [220, 160].forEach((f, i) => this._tone(f, 0.2, { type: "sawtooth", volume: 0.4, delay: i * 0.14 }));
+  },
+  playLevelUp() {
+    [523, 659, 784, 1046].forEach((f, i) => this._tone(f, 0.16, { type: "square", volume: 0.5, delay: i * 0.08 }));
+  },
+  playGameOver() {
+    [392, 330, 262, 196].forEach((f, i) => this._tone(f, 0.32, { type: "triangle", volume: 0.4, delay: i * 0.16 }));
+  },
+
+  // A steady 4-note bass pulse — simple on purpose, so it reads as a beat
+  // to move to rather than something fighting the gesture SFX for attention.
+  startMusic() {
+    if (!this.ctx || this.timer) return;
+    const bass = [130.81, 130.81, 164.81, 196.0];
+    const stepMs = 220;
+    const playStep = () => {
+      if (this.musicOn) {
+        const freq = bass[this.step % bass.length];
+        this._tone(freq, 0.18, { type: "triangle", bus: "music", volume: 0.6 });
+        this._tone(freq * 2, 0.09, { type: "square", bus: "music", volume: 0.25, delay: 0.11 });
+      }
+      this.step++;
+    };
+    playStep();
+    this.timer = setInterval(playStep, stepMs);
+  },
+  stopMusic() {
+    clearInterval(this.timer);
+    this.timer = null;
+    this.step = 0;
+  },
+  toggleMusic() {
+    this.musicOn = !this.musicOn;
+    return this.musicOn;
+  },
+};
+
 // ---- DOM references ----------------------------------------------------------
 // This script is loaded with type="module", which behaves like `defer`, so
 // the document is already parsed by the time this runs — no need to wait
 // for DOMContentLoaded.
 const videoEl = document.getElementById("webcam");
-const skeletonCanvas = document.getElementById("skeleton-canvas");
-const skeletonCtx = skeletonCanvas ? skeletonCanvas.getContext("2d") : null;
+const muteButtonEl = document.getElementById("mute-button");
+const debugPanelEl = document.getElementById("debug-panel");
 
 const startScreenEl = document.getElementById("start-screen");
 const startButtonEl = document.getElementById("start-button");
@@ -212,12 +319,14 @@ function advanceStep() {
   if (currentStepIndex >= currentRecipe.ingredients.length) {
     succeedRound();
   } else {
+    Audio.playCorrect();
     highlightCurrentStep();
   }
 }
 
 function registerMistake() {
   mistakes++;
+  Audio.playMistake();
   flashCurrentStepError();
 }
 
@@ -266,6 +375,7 @@ function succeedRound() {
   combo++;
   ordersCompleted++;
   score += scoreForOrder(currentRecipe, stars, combo);
+  Audio.playServe();
   if (ordersCompleted % CONFIG.levelUpEveryOrders === 0) levelUp();
 
   updateHUD();
@@ -277,6 +387,7 @@ function failRound() {
   state = "RESULT";
   combo = 0;
   lives = Math.max(0, lives - 1);
+  Audio.playMissed();
 
   updateHUD();
   showResult({ stars: 0, missed: true });
@@ -285,12 +396,15 @@ function failRound() {
 
 function levelUp() {
   level++;
+  Audio.playLevelUp();
   levelEl.classList.add("level-up");
   setTimeout(() => levelEl.classList.remove("level-up"), 600);
 }
 
 function gameOver() {
   state = "GAME_OVER";
+  Audio.stopMusic();
+  Audio.playGameOver();
   finalScoreEl.textContent = score;
   gameOverScreenEl.classList.remove("hidden");
   hudEl.classList.add("hidden");
@@ -371,72 +485,63 @@ function showTrackingBanner(show) {
   trackingLostBannerEl.classList.toggle("hidden", !show);
 }
 
-function drawSkeleton({ pose, hands }) {
-  if (!CONFIG.showSkeleton || !skeletonCanvas) return;
-  if (videoEl.videoWidth && skeletonCanvas.width !== videoEl.videoWidth) {
-    skeletonCanvas.width = videoEl.videoWidth;
-    skeletonCanvas.height = videoEl.videoHeight;
-  }
-  const { width, height } = skeletonCanvas;
-  skeletonCtx.clearRect(0, 0, width, height);
-
-  skeletonCtx.fillStyle = "#39ff88";
-  for (const p of pose) {
-    if (p.visibility != null && p.visibility < 0.4) continue;
-    skeletonCtx.beginPath();
-    skeletonCtx.arc(p.x * width, p.y * height, 4, 0, Math.PI * 2);
-    skeletonCtx.fill();
-  }
-
-  skeletonCtx.fillStyle = "#ffd23f";
-  for (const hand of hands) {
-    for (const p of hand) {
-      skeletonCtx.beginPath();
-      skeletonCtx.arc(p.x * width, p.y * height, 3, 0, Math.PI * 2);
-      skeletonCtx.fill();
-    }
-  }
+// No dots drawn over the camera. Press "d" during play to reveal this
+// instead — the live numbers bodytracking.js is already computing for every
+// detector, versus the threshold each one needs to cross. If a gesture isn't
+// registering, this tells you whether it's close (nudge a threshold in
+// bodytracking.js's CONFIG) or nowhere near (something else is wrong).
+function renderDebug(debug) {
+  if (!debugPanelEl || debugPanelEl.classList.contains("hidden") || !debug) return;
+  const line = (label, value, cmp, threshold) =>
+    `${label.padEnd(8)} ${value.toFixed(2).padStart(6)}  ${cmp} ${threshold}`;
+  debugPanelEl.textContent = [
+    `calibrated: ${debug.calibrated}`,
+    line("lean", debug.leanOffset, "±", debug.leanThreshold.toFixed(2)),
+    line("raiseL", debug.raiseLeft, ">", debug.raiseThreshold.toFixed(2)),
+    line("raiseR", debug.raiseRight, ">", debug.raiseThreshold.toFixed(2)),
+    line("clap", debug.clapDist, "<", debug.clapThreshold.toFixed(2)),
+    line("shake", debug.shakeEnergy, ">", debug.shakeThreshold.toFixed(2)),
+    line("forward", debug.forwardScale, ">", debug.forwardThreshold.toFixed(2)),
+  ].join("\n");
 }
 
 // =============================================================================
 // Calibration flow
 // =============================================================================
-function runCalibrationCountdown(ms) {
-  return new Promise((resolve) => {
-    const start = performance.now();
-    function tick() {
-      const elapsed = performance.now() - start;
-      const remaining = Math.ceil((ms - elapsed) / 1000);
-      calibrationMessageEl.textContent =
-        remaining > 0 ? `Stand naturally, hold still... ${remaining}` : "Hold it!";
-      if (elapsed < ms) requestAnimationFrame(tick);
-      else resolve();
-    }
-    tick();
-  });
-}
-
 async function startFlow() {
   startButtonEl.disabled = true;
   startButtonEl.textContent = "Loading camera & AI models...";
+
+  // Must run inside this click handler's call stack for browsers to allow it.
+  Audio.init();
+  Audio.resume();
+
   try {
     await tracker.init();
     // Detection loop must be running before calibrate() can sample frames.
     tracker.start();
+    Audio.startMusic();
 
     startScreenEl.classList.add("hidden");
     calibrationOverlayEl.classList.remove("hidden");
     calibrationMessageEl.textContent = "Stand naturally, hold still...";
 
-    await Promise.all([
-      tracker.calibrate(CONFIG.calibrationMs),
-      runCalibrationCountdown(CONFIG.calibrationMs),
-    ]);
+    // calibrate() now waits for real samples rather than a fixed clock, so
+    // if it's taking noticeably longer than usual, say so instead of leaving
+    // the screen looking stuck.
+    const slowNotice = setTimeout(() => {
+      calibrationMessageEl.textContent =
+        "Still looking for you — make sure your shoulders and hands are in frame.";
+    }, CONFIG.calibrationMs + 1000);
+
+    await tracker.calibrate(CONFIG.calibrationMs);
+    clearTimeout(slowNotice);
 
     calibrationOverlayEl.classList.add("hidden");
     beginGame();
   } catch (err) {
     console.error(err);
+    Audio.stopMusic();
     calibrationMessageEl.textContent = err.message || "Something went wrong.";
     calibrationOverlayEl.classList.remove("hidden");
     startScreenEl.classList.remove("hidden");
@@ -451,9 +556,20 @@ async function startFlow() {
 startButtonEl.addEventListener("click", startFlow);
 restartButtonEl.addEventListener("click", beginGame);
 
+muteButtonEl.addEventListener("click", () => {
+  const on = Audio.toggleMusic();
+  muteButtonEl.textContent = on ? "🔊" : "🔇";
+});
+
+// Hidden by default — press "d" during play to see live gesture numbers
+// instead of skeleton dots over the camera.
+document.addEventListener("keydown", (e) => {
+  if (e.key.toLowerCase() === "d") debugPanelEl.classList.toggle("hidden");
+});
+
 tracker.addEventListener("gesture", onGesture);
 
-tracker.addEventListener("pose", (e) => drawSkeleton(e.detail));
+tracker.addEventListener("pose", (e) => renderDebug(e.detail.debug));
 
 tracker.addEventListener("lost", () => {
   showTrackingBanner(true);
